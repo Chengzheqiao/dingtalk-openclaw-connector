@@ -66,20 +66,24 @@ async function getOapiAccessToken(config: any): Promise<string | null> {
   }
 }
 
-function buildMediaSystemPrompt(oapiToken: string): string {
-  return `## 钉钉图片显示规则（强制）
+function buildMediaSystemPrompt(): string {
+  return `## 钉钉图片显示规则
 
-你正在钉钉中与用户对话。钉钉**只能显示已上传的图片**，无法显示本地路径。
-
-### 禁止使用
-- \`file://\` 路径、\`attachment://\` 路径、本地路径、猜测的 URL
+你正在钉钉中与用户对话。显示图片时，直接使用本地文件路径，系统会自动上传处理。
 
 ### 正确方式
-1. **先上传**：\`curl -s -X POST "https://oapi.dingtalk.com/media/upload?access_token=${oapiToken}&type=image" -F "media=@/图片路径.jpg"\`
-2. **确认成功**：检查返回的 media_id
-3. **再回复**：\`![描述](@lADPxxxxxx)\`
+\`\`\`markdown
+![描述](file:///path/to/image.jpg)
+![描述](/tmp/screenshot.png)
+![描述](/Users/xxx/photo.jpg)
+\`\`\`
 
-media_id 以 \`@\` 开头，直接使用，不拼接任何 URL 前缀。`;
+### 禁止
+- 不要自己执行 curl 上传
+- 不要猜测或构造 URL
+- 不要使用 https://oapi.dingtalk.com/... 这类地址
+
+直接输出本地路径即可，系统会自动上传到钉钉。`;
 }
 
 // ============ 图片后处理：自动上传本地图片到钉钉 ============
@@ -97,10 +101,18 @@ const LOCAL_IMAGE_RE = /!\[([^\]]*)\]\(((?:file:\/\/\/|MEDIA:|attachment:\/\/\/)
 
 /** 去掉 file:// / MEDIA: / attachment:// 前缀，得到实际的绝对路径 */
 function toLocalPath(raw: string): string {
-  if (raw.startsWith('file://')) return raw.replace('file://', '');
-  if (raw.startsWith('MEDIA:')) return raw.replace('MEDIA:', '');
-  if (raw.startsWith('attachment://')) return raw.replace('attachment://', '');
-  return raw;
+  let path = raw;
+  if (path.startsWith('file://')) path = path.replace('file://', '');
+  else if (path.startsWith('MEDIA:')) path = path.replace('MEDIA:', '');
+  else if (path.startsWith('attachment://')) path = path.replace('attachment://', '');
+
+  // 解码 URL 编码的路径（如中文字符 %E5%9B%BE → 图）
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // 解码失败则保持原样
+  }
+  return path;
 }
 
 /** 上传本地文件到钉钉，返回 media_id（以 @ 开头） */
@@ -528,11 +540,11 @@ async function handleDingTalkMessage(params: {
   let oapiToken: string | null = null;
 
   if (dingtalkConfig.enableMediaUpload !== false) {
+    // 添加图片使用提示（告诉 LLM 直接输出本地路径）
+    systemPrompts.push(buildMediaSystemPrompt());
+    // 获取 token 用于后处理上传
     oapiToken = await getOapiAccessToken(dingtalkConfig);
     log?.info?.(`[DingTalk][Media] oapiToken 获取${oapiToken ? '成功' : '失败'}`);
-    if (oapiToken) {
-      systemPrompts.push(buildMediaSystemPrompt(oapiToken));
-    }
   } else {
     log?.info?.(`[DingTalk][Media] enableMediaUpload=false，跳过`);
   }
