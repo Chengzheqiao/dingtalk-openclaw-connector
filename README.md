@@ -1,8 +1,16 @@
 # dingtalk-moltbot-connector
 
-将钉钉机器人连接到 [Moltbot](https://moltbot.com) / [Clawdbot](https://clawdbot.com) Gateway，支持 AI Card 流式响应。
+将钉钉机器人连接到 [Moltbot](https://moltbot.com) / [Clawdbot](https://clawdbot.com) Gateway，支持 AI Card 流式响应和会话管理。
 
-提供两种实现：
+## 特性
+
+- ✅ **AI Card 流式响应** - 打字机效果，实时显示 AI 回复
+- ✅ **会话持久化** - 同一用户的多轮对话共享上下文
+- ✅ **超时自动新会话** - 默认 30 分钟无活动自动开启新对话
+- ✅ **手动新会话** - 发送 `/new` 或 `新会话` 清空对话历史
+- ✅ **图片自动上传** - 本地图片路径自动上传到钉钉
+
+## 两种实现
 
 | | **TypeScript 插件** | **Python 独立连接器** |
 |---|---|---|
@@ -61,6 +69,8 @@ clawdbot plugins install -l ./dingtalk-moltbot-connector
       "clientId": "dingxxxxxxxxx",       // 钉钉 AppKey
       "clientSecret": "your_secret_here", // 钉钉 AppSecret
       "gatewayToken": "",                 // 可选：Gateway 认证 token
+      "gatewayPassword": "",              // 可选：Gateway 认证 password（与 token 二选一）
+      "sessionTimeout": 1800000,          // 可选：会话超时(ms)，默认 30 分钟
     }
   },
   "gateway": {
@@ -147,6 +157,15 @@ connector.start()
 | `clientId` / `dingtalk_client_id` | `DINGTALK_CLIENT_ID` | 钉钉 AppKey |
 | `clientSecret` / `dingtalk_client_secret` | `DINGTALK_CLIENT_SECRET` | 钉钉 AppSecret |
 | `gatewayToken` / `gateway_token` | `MOLTBOT_GATEWAY_TOKEN` | Gateway 认证 token（可选） |
+| `gatewayPassword` | — | Gateway 认证 password（可选，与 token 二选一） |
+| `sessionTimeout` | — | 会话超时时间，单位毫秒（默认 1800000 = 30分钟） |
+
+## 会话命令
+
+用户可以发送以下命令开启新会话（清空对话历史）：
+
+- `/new`、`/reset`、`/clear`
+- `新会话`、`重新开始`、`清空对话`
 
 ## 项目结构
 

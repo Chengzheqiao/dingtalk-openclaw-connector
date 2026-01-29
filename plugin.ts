@@ -20,6 +20,65 @@ function getRuntime(): PluginRuntime {
   return runtime;
 }
 
+// ============ Session 管理 ============
+
+/** 用户会话状态：记录最后活跃时间和当前 session 标识 */
+interface UserSession {
+  lastActivity: number;
+  sessionId: string;  // 格式: dingtalk:<senderId> 或 dingtalk:<senderId>:<timestamp>
+}
+
+/** 用户会话缓存 Map<senderId, UserSession> */
+const userSessions = new Map<string, UserSession>();
+
+/** 新会话触发命令 */
+const NEW_SESSION_COMMANDS = ['/new', '/reset', '/clear', '新会话', '重新开始', '清空对话'];
+
+/** 检查消息是否是新会话命令 */
+function isNewSessionCommand(text: string): boolean {
+  const trimmed = text.trim().toLowerCase();
+  return NEW_SESSION_COMMANDS.some(cmd => trimmed === cmd.toLowerCase());
+}
+
+/** 获取或创建用户 session key */
+function getSessionKey(
+  senderId: string,
+  forceNew: boolean,
+  sessionTimeout: number,
+  log?: any,
+): { sessionKey: string; isNew: boolean } {
+  const now = Date.now();
+  const existing = userSessions.get(senderId);
+
+  // 强制新会话
+  if (forceNew) {
+    const sessionId = `dingtalk:${senderId}:${now}`;
+    userSessions.set(senderId, { lastActivity: now, sessionId });
+    log?.info?.(`[DingTalk][Session] 用户主动开启新会话: ${senderId}`);
+    return { sessionKey: sessionId, isNew: true };
+  }
+
+  // 检查超时
+  if (existing) {
+    const elapsed = now - existing.lastActivity;
+    if (elapsed > sessionTimeout) {
+      const sessionId = `dingtalk:${senderId}:${now}`;
+      userSessions.set(senderId, { lastActivity: now, sessionId });
+      log?.info?.(`[DingTalk][Session] 会话超时(${Math.round(elapsed / 60000)}分钟)，自动开启新会话: ${senderId}`);
+      return { sessionKey: sessionId, isNew: true };
+    }
+    // 更新活跃时间
+    existing.lastActivity = now;
+    return { sessionKey: existing.sessionId, isNew: false };
+  }
+
+  // 首次会话
+  const sessionId = `dingtalk:${senderId}`;
+  userSessions.set(senderId, { lastActivity: now, sessionId });
+  log?.info?.(`[DingTalk][Session] 新用户首次会话: ${senderId}`);
+  return { sessionKey: sessionId, isNew: false };
+}
+
 // ============ Access Token 缓存 ============
 
 let accessToken: string | null = null;
@@ -370,12 +429,16 @@ async function finishAICard(
 
 // ============ Gateway SSE Streaming ============
 
-async function* streamFromGateway(
-  userContent: string,
-  systemPrompts: string[],
-  gatewayToken?: string,
-  log?: any,
-): AsyncGenerator<string, void, unknown> {
+interface GatewayOptions {
+  userContent: string;
+  systemPrompts: string[];
+  sessionKey: string;
+  gatewayAuth?: string;  // token 或 password，都用 Bearer 格式
+  log?: any;
+}
+
+async function* streamFromGateway(options: GatewayOptions): AsyncGenerator<string, void, unknown> {
+  const { userContent, systemPrompts, sessionKey, gatewayAuth, log } = options;
   const rt = getRuntime();
   const gatewayUrl = `http://127.0.0.1:${rt.gateway?.port || 18789}/v1/chat/completions`;
 
@@ -386,11 +449,11 @@ async function* streamFromGateway(
   messages.push({ role: 'user', content: userContent });
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (gatewayToken) {
-    headers['Authorization'] = `Bearer ${gatewayToken}`;
+  if (gatewayAuth) {
+    headers['Authorization'] = `Bearer ${gatewayAuth}`;
   }
 
-  log?.info?.(`[DingTalk][Gateway] POST ${gatewayUrl}, messages count=${messages.length}, userContent="${userContent.slice(0, 80)}..."`);
+  log?.info?.(`[DingTalk][Gateway] POST ${gatewayUrl}, session=${sessionKey}, messages=${messages.length}`);
 
   const response = await fetch(gatewayUrl, {
     method: 'POST',
@@ -399,6 +462,7 @@ async function* streamFromGateway(
       model: 'default',
       messages,
       stream: true,
+      user: sessionKey,  // 用于 session 持久化
     }),
   });
 
@@ -541,6 +605,27 @@ async function handleDingTalkMessage(params: {
 
   log?.info?.(`[DingTalk] 收到消息: from=${senderName} text="${content.text.slice(0, 50)}..."`);
 
+  // ===== Session 管理 =====
+  const sessionTimeout = dingtalkConfig.sessionTimeout ?? 1800000; // 默认 30 分钟
+  const forceNewSession = isNewSessionCommand(content.text);
+
+  // 如果是新会话命令，直接回复确认消息
+  if (forceNewSession) {
+    const { sessionKey } = getSessionKey(senderId, true, sessionTimeout, log);
+    await sendMessage(dingtalkConfig, sessionWebhook, '✨ 已开启新会话，之前的对话已清空。', {
+      atUserId: !isDirect ? senderId : null,
+    });
+    log?.info?.(`[DingTalk] 用户请求新会话: ${senderId}, newKey=${sessionKey}`);
+    return;
+  }
+
+  // 获取或创建 session
+  const { sessionKey, isNew } = getSessionKey(senderId, false, sessionTimeout, log);
+  log?.info?.(`[DingTalk][Session] key=${sessionKey}, isNew=${isNew}`);
+
+  // Gateway 认证：优先使用 token，其次 password
+  const gatewayAuth = dingtalkConfig.gatewayToken || dingtalkConfig.gatewayPassword || '';
+
   // 构建 system prompts & 获取 oapi token（用于图片后处理）
   const systemPrompts: string[] = [];
   let oapiToken: string | null = null;
@@ -574,7 +659,13 @@ async function handleDingTalkMessage(params: {
 
     try {
       log?.info?.(`[DingTalk] 开始请求 Gateway 流式接口...`);
-      for await (const chunk of streamFromGateway(content.text, systemPrompts, dingtalkConfig.gatewayToken, log)) {
+      for await (const chunk of streamFromGateway({
+        userContent: content.text,
+        systemPrompts,
+        sessionKey,
+        gatewayAuth,
+        log,
+      })) {
         accumulated += chunk;
         chunkCount++;
 
@@ -617,7 +708,13 @@ async function handleDingTalkMessage(params: {
 
     let fullResponse = '';
     try {
-      for await (const chunk of streamFromGateway(content.text, systemPrompts, dingtalkConfig.gatewayToken, log)) {
+      for await (const chunk of streamFromGateway({
+        userContent: content.text,
+        systemPrompts,
+        sessionKey,
+        gatewayAuth,
+        log,
+      })) {
         fullResponse += chunk;
       }
 
@@ -675,6 +772,8 @@ const dingtalkPlugin = {
         allowFrom: { type: 'array', items: { type: 'string' }, description: 'Allowed sender IDs' },
         groupPolicy: { type: 'string', enum: ['open', 'allowlist'], default: 'open' },
         gatewayToken: { type: 'string', default: '', description: 'Gateway auth token (Bearer)' },
+        gatewayPassword: { type: 'string', default: '', description: 'Gateway auth password (alternative to token)' },
+        sessionTimeout: { type: 'number', default: 1800000, description: 'Session timeout in ms (default 30min)' },
         debug: { type: 'boolean', default: false },
       },
       required: ['clientId', 'clientSecret'],
