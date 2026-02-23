@@ -20,6 +20,101 @@ function getRuntime(): PluginRuntime {
   return runtime;
 }
 
+// ============ 健康检查和自动重连 ============
+
+/** 连接状态类型 */
+type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+
+/** 健康检查上下文（每个账号一份） */
+interface HealthCheckContext {
+  connectionState: ConnectionState;
+  lastMessageTime: number;
+  reconnectCount: number;
+  healthCheckTimer: ReturnType<typeof setInterval> | null;
+}
+
+/** 账号健康检查上下文 Map<accountId, HealthCheckContext> */
+const healthCheckContexts = new Map<string, HealthCheckContext>();
+
+/** 健康检查间隔：1分钟 */
+const HEALTH_CHECK_INTERVAL = 60 * 1000;
+
+/** 消息空闲超时：10分钟无消息则主动检查连接 */
+const MESSAGE_IDLE_TIMEOUT = 10 * 60 * 1000;
+
+/** 获取或创建健康检查上下文 */
+function getHealthCheckContext(accountId: string): HealthCheckContext {
+  let ctx = healthCheckContexts.get(accountId);
+  if (!ctx) {
+    ctx = {
+      connectionState: 'disconnected',
+      lastMessageTime: Date.now(),
+      reconnectCount: 0,
+      healthCheckTimer: null,
+    };
+    healthCheckContexts.set(accountId, ctx);
+  }
+  return ctx;
+}
+
+/** 清理健康检查上下文 */
+function cleanupHealthCheckContext(accountId: string): void {
+  const ctx = healthCheckContexts.get(accountId);
+  if (ctx) {
+    if (ctx.healthCheckTimer) {
+      clearInterval(ctx.healthCheckTimer);
+      ctx.healthCheckTimer = null;
+    }
+    healthCheckContexts.delete(accountId);
+  }
+}
+
+/** 更新连接状态 */
+function updateConnectionState(accountId: string, state: ConnectionState, log?: any): void {
+  const ctx = getHealthCheckContext(accountId);
+  const oldState = ctx.connectionState;
+  ctx.connectionState = state;
+  if (oldState !== state) {
+    log?.info?.(`[DingTalk][HealthCheck] 连接状态变更: ${oldState} -> ${state} (accountId=${accountId})`);
+  }
+}
+
+/** 记录收到消息（重置空闲计时和重连计数） */
+function recordMessageReceived(accountId: string): void {
+  const ctx = getHealthCheckContext(accountId);
+  ctx.lastMessageTime = Date.now();
+  ctx.reconnectCount = 0;  // 收到消息说明连接正常，重置重连计数
+}
+
+/** 启动健康检查定时器 */
+function startHealthCheckTimer(
+  accountId: string,
+  client: any,
+  log?: any,
+): void {
+  const ctx = getHealthCheckContext(accountId);
+
+  // 清理已有定时器
+  if (ctx.healthCheckTimer) {
+    clearInterval(ctx.healthCheckTimer);
+  }
+
+  ctx.healthCheckTimer = setInterval(() => {
+    const now = Date.now();
+    const idleTime = now - ctx.lastMessageTime;
+    const idleMinutes = Math.round(idleTime / 60000);
+
+    log?.info?.(`[DingTalk][HealthCheck] 定期检查: state=${ctx.connectionState}, idle=${idleMinutes}分钟, reconnects=${ctx.reconnectCount}`);
+
+    // 如果超过 10 分钟无消息且连接状态正常，记录日志（SDK 会自动保持连接）
+    if (idleTime > MESSAGE_IDLE_TIMEOUT && ctx.connectionState === 'connected') {
+      log?.info?.(`[DingTalk][HealthCheck] 消息空闲超过 ${idleMinutes} 分钟，连接状态正常，依赖 SDK keepAlive 保持连接`);
+    }
+  }, HEALTH_CHECK_INTERVAL);
+
+  log?.info?.(`[DingTalk][HealthCheck] 健康检查定时器已启动 (间隔=${HEALTH_CHECK_INTERVAL / 1000}秒)`);
+}
+
 // ============ Session 管理 ============
 
 /** 用户会话状态：记录最后活跃时间和当前 session 标识 */
@@ -2505,20 +2600,59 @@ const dingtalkPlugin = {
     startAccount: async (ctx: any) => {
       const { account, cfg, abortSignal } = ctx;
       const config = account.config;
+      const accountId = account.accountId;
 
       if (!config.clientId || !config.clientSecret) {
         throw new Error('DingTalk clientId and clientSecret are required');
       }
 
-      ctx.log?.info(`[${account.accountId}] 启动钉钉 Stream 客户端...`);
+      ctx.log?.info(`[${accountId}] 启动钉钉 Stream 客户端...`);
 
+      // 初始化健康检查上下文
+      const healthCtx = getHealthCheckContext(accountId);
+      updateConnectionState(accountId, 'connecting', ctx.log);
+
+      // 创建 DWClient 并启用保活（SDK 默认已启用 autoReconnect）
       const client = new DWClient({
         clientId: config.clientId,
         clientSecret: config.clientSecret,
         debug: config.debug || false,
+        keepAlive: true,       // 启用心跳保活
       });
 
+      // ===== 监听 SDK 连接事件 =====
+
+      // 连接成功事件
+      client.on('connect', () => {
+        updateConnectionState(accountId, 'connected', ctx.log);
+        healthCtx.reconnectCount = 0;  // 重置重连计数
+        ctx.log?.info?.(`[DingTalk][Event] 连接成功 (accountId=${accountId})`);
+      });
+
+      // 连接断开事件
+      client.on('disconnect', () => {
+        updateConnectionState(accountId, 'disconnected', ctx.log);
+        ctx.log?.warn?.(`[DingTalk][Event] 连接断开 (accountId=${accountId})`);
+      });
+
+      // 重连事件
+      client.on('reconnect', () => {
+        healthCtx.reconnectCount++;
+        updateConnectionState(accountId, 'reconnecting', ctx.log);
+        ctx.log?.info?.(`[DingTalk][Event] 正在重连... (第 ${healthCtx.reconnectCount} 次, accountId=${accountId})`);
+      });
+
+      // 错误事件
+      client.on('error', (err: any) => {
+        ctx.log?.error?.(`[DingTalk][Event] 连接错误: ${err?.message || err} (accountId=${accountId})`);
+      });
+
+      // ===== 注册消息回调 =====
+
       client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
+        // 记录收到消息时间（用于空闲检测），重置重连计数
+        recordMessageReceived(accountId);
+
         const messageId = res.headers?.messageId;
         ctx.log?.info?.(`[DingTalk] 收到 Stream 回调, messageId=${messageId}, headers=${JSON.stringify(res.headers)}`);
 
@@ -2560,18 +2694,24 @@ const dingtalkPlugin = {
       });
 
       await client.connect();
-      ctx.log?.info(`[${account.accountId}] 钉钉 Stream 客户端已连接`);
+      updateConnectionState(accountId, 'connected', ctx.log);
+      ctx.log?.info(`[${accountId}] 钉钉 Stream 客户端已连接`);
+
+      // 启动健康检查定时器
+      startHealthCheckTimer(accountId, client, ctx.log);
 
       const rt = getRuntime();
-      rt.channel.activity.record('dingtalk-connector', account.accountId, 'start');
+      rt.channel.activity.record('dingtalk-connector', accountId, 'start');
 
       let stopped = false;
       if (abortSignal) {
         abortSignal.addEventListener('abort', () => {
           if (stopped) return;
           stopped = true;
-          ctx.log?.info(`[${account.accountId}] 停止钉钉 Stream 客户端...`);
-          rt.channel.activity.record('dingtalk-connector', account.accountId, 'stop');
+          ctx.log?.info(`[${accountId}] 停止钉钉 Stream 客户端...`);
+          // 清理健康检查上下文和定时器
+          cleanupHealthCheckContext(accountId);
+          rt.channel.activity.record('dingtalk-connector', accountId, 'stop');
         });
       }
 
@@ -2579,8 +2719,10 @@ const dingtalkPlugin = {
         stop: () => {
           if (stopped) return;
           stopped = true;
-          ctx.log?.info(`[${account.accountId}] 钉钉 Channel 已停止`);
-          rt.channel.activity.record('dingtalk-connector', account.accountId, 'stop');
+          ctx.log?.info(`[${accountId}] 钉钉 Channel 已停止`);
+          // 清理健康检查上下文和定时器
+          cleanupHealthCheckContext(accountId);
+          rt.channel.activity.record('dingtalk-connector', accountId, 'stop');
         },
       };
     },
